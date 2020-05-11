@@ -57,6 +57,15 @@ func (m *MockClient) CheckAndPut(arg0 *hrpc.Mutate, arg1, arg2 string, arg3 []by
 	return ret0, ret1
 }
 
+// CheckAndPut mocks base method
+func (m *MockClient) CheckNullAndPut(arg0 *hrpc.Mutate, arg1, arg2 string) (bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CheckNullAndPut", arg0, arg1, arg2)
+	ret0, _ := ret[0].(bool)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
 // CheckAndPut indicates an expected call of CheckAndPut
 func (mr *MockClientMockRecorder) CheckAndPut(arg0, arg1, arg2, arg3 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()

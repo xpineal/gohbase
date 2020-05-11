@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/golang/protobuf/proto"
@@ -263,6 +264,16 @@ func (c *client) lookupRegion(ctx context.Context,
 }
 
 func (c *client) findRegion(ctx context.Context, table, key []byte) (hrpc.RegionInfo, error) {
+	//get or create table related lcck in hash
+	var tableName = string(table)
+	var iLocker, _ = c.tMetaLockHash.LoadOrStore(tableName, &sync.Mutex{})
+	var locker = iLocker.(*sync.Mutex)
+	locker.Lock()
+	defer locker.Unlock()
+
+	if reg := c.getRegionFromCache(table, key); reg != nil {
+		return reg, nil
+	}
 	// The region was not in the cache, it
 	// must be looked up in the meta table
 	reg, addr, err := c.lookupRegion(ctx, table, key)
