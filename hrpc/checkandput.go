@@ -52,6 +52,31 @@ func NewCheckAndPut(put *Mutate, family string,
 	}, nil
 }
 
+// NewNotExistPut create a new CheckAndPut request that will check the specific family:qualifier
+// never exist, if not exist then put the value
+func NewNotExistPut(put *Mutate, family string, qualifier string) (*CheckAndPut, error) {
+	if put.mutationType != pb.MutationProto_PUT {
+		return nil, fmt.Errorf("'NewNotExistPut' only takes 'Put' request")
+	}
+
+	// The condition that needs to match for the edit to be applied.
+	cmp, err := filter.NewNullComparator().ConstructPBComparator()
+	if err != nil {
+		return nil, err
+	}
+
+	// CheckAndPut is not batchable as MultiResponse doesn't return Processed field
+	// for Mutate Action
+	put.setSkipBatch(true)
+
+	return &CheckAndPut{
+		Mutate:     put,
+		family:     []byte(family),
+		qualifier:  []byte(qualifier),
+		comparator: cmp,
+	}, nil
+}
+
 // ToProto converts the RPC into a protobuf message
 func (cp *CheckAndPut) ToProto() proto.Message {
 	mutateRequest := cp.toProto()
