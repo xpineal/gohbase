@@ -10,9 +10,9 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strconv"
 	"testing"
 
-	"github.com/aristanetworks/goarista/test"
 	"github.com/golang/mock/gomock"
 	"github.com/tsuna/gohbase/hrpc"
 	"github.com/tsuna/gohbase/region"
@@ -38,12 +38,16 @@ func TestMetaCache(t *testing.T) {
 	)
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
+
 	regClient := mockRegion.NewMockRegionClient(ctrl)
-	regClient.EXPECT().String().Return("mock region client").AnyTimes()
 	regClient.EXPECT().Addr().Return("regionserver:1").AnyTimes()
+	regClient.EXPECT().String().Return("mock region client").AnyTimes()
+	newClientFn := func() hrpc.RegionClient {
+		return regClient
+	}
 
 	client.regions.put(wholeTable)
-	client.clients.put(regClient, wholeTable)
+	client.clients.put("regionserver:1", wholeTable, newClientFn)
 
 	reg = client.getRegionFromCache([]byte("test"), []byte("theKey"))
 	if !reflect.DeepEqual(reg, wholeTable) {
@@ -71,7 +75,7 @@ func TestMetaCache(t *testing.T) {
 	} else if len(os) != 0 {
 		t.Errorf("Didn't expect any overlaps, got: %v", os)
 	}
-	client.clients.put(regClient, region1)
+	client.clients.put("regionserver:1", region1, newClientFn)
 
 	region2 := region.NewInfo(
 		0,
@@ -86,7 +90,7 @@ func TestMetaCache(t *testing.T) {
 	} else if len(os) != 0 {
 		t.Errorf("Didn't expect any overlaps, got: %v", os)
 	}
-	client.clients.put(regClient, region2)
+	client.clients.put("regionserver:1", region2, newClientFn)
 
 	region3 := region.NewInfo(
 		0,
@@ -101,7 +105,7 @@ func TestMetaCache(t *testing.T) {
 	} else if len(os) != 0 {
 		t.Errorf("Didn't expect any overlaps, got: %v", os)
 	}
-	client.clients.put(regClient, region3)
+	client.clients.put("regionserver:1", region3, newClientFn)
 
 	testcases := []struct {
 		key string
@@ -136,7 +140,7 @@ func TestMetaCache(t *testing.T) {
 	} else if len(os) != 1 || os[0] != region3 {
 		t.Errorf("Expected one overlap, got: %v", os)
 	}
-	client.clients.put(regClient, region4)
+	client.clients.put("regionserver:1", region4, newClientFn)
 
 	reg = client.getRegionFromCache([]byte("test"), []byte("theKey"))
 	if !reflect.DeepEqual(reg, region4) {
@@ -378,31 +382,32 @@ func TestRegionCacheAge(t *testing.T) {
 
 	client := newClient("~invalid.quorum~")
 	for i, tcase := range tcases {
-		client.regions.regions.Clear()
-		// set up initial cache
-		for _, region := range tcase.cachedRegions {
-			client.regions.put(region)
-		}
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			client.regions.regions.Clear()
+			// set up initial cache
+			for _, region := range tcase.cachedRegions {
+				client.regions.put(region)
+			}
 
-		overlaps, replaced := client.regions.put(tcase.newRegion)
-		if replaced != tcase.replaced {
-			t.Errorf("Test %d: Expected %v, got %v", i, tcase.replaced, replaced)
-		}
+			overlaps, replaced := client.regions.put(tcase.newRegion)
+			if replaced != tcase.replaced {
+				t.Errorf("expected %v, got %v", tcase.replaced, replaced)
+			}
 
-		expectedNames := make(regionNames, len(tcase.cachedRegions))
-		for i, r := range tcase.cachedRegions {
-			expectedNames[i] = r.Name()
-		}
-		osNames := make(regionNames, len(overlaps))
-		for i, o := range overlaps {
-			osNames[i] = o.Name()
-		}
+			expectedNames := make(regionNames, len(tcase.cachedRegions))
+			for i, r := range tcase.cachedRegions {
+				expectedNames[i] = r.Name()
+			}
+			osNames := make(regionNames, len(overlaps))
+			for i, o := range overlaps {
+				osNames[i] = o.Name()
+			}
 
-		// check overlaps are correct
-		if diff := test.Diff(expectedNames, osNames); diff != "" {
-			t.Errorf("Test %d: Expected: %v\nReceived: %v\nDiff:%s",
-				i, expectedNames, osNames, diff)
-		}
+			// check overlaps are correct
+			if !reflect.DeepEqual(expectedNames, osNames) {
+				t.Errorf("expected %v, got %v", expectedNames, osNames)
+			}
+		})
 	}
 }
 
@@ -630,19 +635,21 @@ func TestClientCachePut(t *testing.T) {
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	regClient := mockRegion.NewMockRegionClient(ctrl)
-	regClient.EXPECT().String().Return("mock region client").AnyTimes()
-	regClient.EXPECT().Addr().Return("regionserver:1").AnyTimes()
 
-	existing := client.clients.put(regClient, region.NewInfo(
-		0,
-		nil,
-		[]byte("test"),
-		[]byte("test,,1234567890042.yoloyoloyoloyoloyoloyoloyoloyolo."),
-		nil, nil))
+	var newClientCalled bool
 
-	if existing != regClient {
-		t.Errorf("Unexpected regClient from put: %v", existing)
+	regClient := client.clients.put("regionserver:1", region.NewInfo(0, nil, []byte("test"),
+		[]byte("test,,1234567890042.yoloyoloyoloyoloyoloyoloyoloyolo."), nil, nil),
+		func() hrpc.RegionClient {
+			newClientCalled = true
+			regClient := mockRegion.NewMockRegionClient(ctrl)
+			regClient.EXPECT().Addr().Return("regionserver:1").AnyTimes()
+			regClient.EXPECT().String().Return("mock region client").AnyTimes()
+			return regClient
+		})
+
+	if !newClientCalled {
+		t.Fatal("expected newClient to be called")
 	}
 
 	if len(client.clients.regions) != 1 {
@@ -654,21 +661,16 @@ func TestClientCachePut(t *testing.T) {
 			len(client.clients.regions[regClient]))
 	}
 
-	// try putting client with the same host port
-	regClient2 := mockRegion.NewMockRegionClient(ctrl)
-	regClient.EXPECT().String().Return("mock region client").AnyTimes()
-	regClient2.EXPECT().Addr().Return("regionserver:1").AnyTimes()
+	// but put a different region for the same address
+	regClient2 := client.clients.put("regionserver:1", region.NewInfo(0, nil, []byte("yolo"),
+		[]byte("yolo,,1234567890042.yoloyoloyoloyoloyoloyoloyoloyolo."), nil, nil),
+		func() hrpc.RegionClient {
+			t.Fatal("newClient should not be called")
+			return nil
+		})
 
-	// but put a different region
-	existing = client.clients.put(regClient, region.NewInfo(
-		0,
-		nil,
-		[]byte("yolo"),
-		[]byte("yolo,,1234567890042.yoloyoloyoloyoloyoloyoloyoloyolo."),
-		nil, nil))
-
-	if existing != regClient {
-		t.Errorf("Unexpected regClient from put: %v", existing)
+	if regClient2 != regClient {
+		t.Fatalf("expected to get the same exact region client: %s vs %s", regClient2, regClient)
 	}
 
 	// nothing should have changed in clients cache

@@ -9,11 +9,12 @@ import (
 	"context"
 	"errors"
 	"math"
+	"reflect"
 	"testing"
 	"time"
 
-	"github.com/aristanetworks/goarista/test"
 	"github.com/tsuna/gohbase/filter"
+	"github.com/tsuna/gohbase/test"
 )
 
 func TestFamilesOption(t *testing.T) {
@@ -24,8 +25,8 @@ func TestFamilesOption(t *testing.T) {
 		t.Error(err)
 	}
 
-	if d := test.Diff(f, g.families); d != "" {
-		t.Error(d)
+	if !reflect.DeepEqual(f, g.families) {
+		t.Errorf("expected %v, got %v", f, g.families)
 	}
 
 	_, err = NewPutStr(context.Background(), "", "", nil, Families(f))
@@ -67,10 +68,9 @@ func TestTimeRangeOption(t *testing.T) {
 
 	for _, tcase := range tests {
 		g, err := NewGet(context.Background(), nil, nil, TimeRange(tcase.from, tcase.to))
-		if d := test.Diff(tcase.err, err); d != "" {
-			t.Errorf(d)
+		if !test.ErrEqual(tcase.err, err) {
+			t.Fatalf("expected %v, got %v", tcase.err, err)
 		}
-
 		if tcase.err != nil {
 			continue
 		}
@@ -102,7 +102,7 @@ func TestMaxVersions(t *testing.T) {
 		t.Errorf("expected %d, got %d", vExp, vGot)
 	}
 
-	g, err = NewGet(context.Background(), nil, nil, MaxVersions(uint32(math.MaxUint32)))
+	_, err = NewGet(context.Background(), nil, nil, MaxVersions(uint32(math.MaxUint32)))
 	if err == nil || err.Error() != "'MaxVersions' exceeds supported number of versions" {
 		t.Error(err)
 	}
@@ -125,7 +125,7 @@ func TestMaxResultsPerColumnFamily(t *testing.T) {
 		t.Errorf("expected %d, got %d", rExp, rGot)
 	}
 
-	g, err = NewGet(context.Background(), nil, nil,
+	_, err = NewGet(context.Background(), nil, nil,
 		MaxResultsPerColumnFamily(uint32(math.MaxUint32)))
 	if err == nil || err.Error() !=
 		"'MaxResultsPerColumnFamily' exceeds supported number of value results" {
@@ -150,7 +150,7 @@ func TestResultOffset(t *testing.T) {
 		t.Errorf("expected %d, got %d", rExp, rGot)
 	}
 
-	g, err = NewGet(context.Background(), nil, nil, ResultOffset(uint32(math.MaxUint32)))
+	_, err = NewGet(context.Background(), nil, nil, ResultOffset(uint32(math.MaxUint32)))
 	if err == nil || err.Error() != "'ResultOffset' exceeds supported offset value" {
 		t.Error(err)
 	}

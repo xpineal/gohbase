@@ -15,11 +15,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	log "github.com/sirupsen/logrus"
 	"github.com/tsuna/gohbase/hrpc"
 	"github.com/tsuna/gohbase/region"
 	"github.com/tsuna/gohbase/zk"
+	"google.golang.org/protobuf/proto"
 )
 
 // Constants
@@ -42,10 +42,6 @@ var (
 
 	// ErrClientClosed is returned when the gohbase client has been closed
 	ErrClientClosed = errors.New("client is closed")
-
-	// errMetaLookupThrottled is returned when a lookup for the rpc's region
-	// has been throttled.
-	errMetaLookupThrottled = errors.New("lookup to hbase:meta has been throttled")
 )
 
 const (
@@ -64,11 +60,6 @@ func (c *client) getRegionForRpc(rpc hrpc.Call) (hrpc.RegionInfo, error) {
 
 		if reg, err := c.findRegion(rpc.Context(), rpc.Table(), rpc.Key()); reg != nil {
 			return reg, nil
-		} else if err == errMetaLookupThrottled {
-			// lookup for region has been throttled, check the cache
-			// again but don't count this as SendRPC try as there
-			// might be just too many request going on at a time.
-			i--
 		} else if err != nil {
 			return nil, err
 		}
@@ -203,13 +194,13 @@ func (c *client) lookupRegion(ctx context.Context,
 	for {
 		// If it takes longer than regionLookupTimeout, fail so that we can sleep
 		lookupCtx, cancel := context.WithTimeout(ctx, c.regionLookupTimeout)
-		if c.clientType == adminClient {
+		if c.clientType == region.MasterClient {
 			log.WithField("resource", zk.Master).Debug("looking up master")
 
 			addr, err = c.zkLookup(lookupCtx, zk.Master)
 			cancel()
 			reg = c.adminRegionInfo
-		} else if bytes.Compare(table, metaTableName) == 0 {
+		} else if bytes.Equal(table, metaTableName) {
 			log.WithField("resource", zk.Meta).Debug("looking up region server of hbase:meta")
 
 			addr, err = c.zkLookup(lookupCtx, zk.Meta)
@@ -230,8 +221,6 @@ func (c *client) lookupRegion(ctx context.Context,
 					"err":   err,
 				}).Debug("hbase:meta does not know about this table/key")
 
-				return nil, "", err
-			} else if err == errMetaLookupThrottled {
 				return nil, "", err
 			} else if err == ErrClientClosed {
 				return nil, "", err
@@ -310,7 +299,7 @@ func (c *client) findRegion(ctx context.Context, table, key []byte) (hrpc.Region
 
 // Searches in the regions cache for the region hosting the given row.
 func (c *client) getRegionFromCache(table, key []byte) hrpc.RegionInfo {
-	if c.clientType == adminClient {
+	if c.clientType == region.MasterClient {
 		return c.adminRegionInfo
 	} else if bytes.Equal(table, metaTableName) {
 		return c.metaRegionInfo
@@ -349,32 +338,6 @@ func createRegionSearchKey(table, key []byte) []byte {
 	// we'll find it.
 	metaKey = append(metaKey, ':')
 	return metaKey
-}
-
-// lookupLimit throttles lookups to hbase:meta to metaLookupLimit requests
-// per metaLookupInterval. It returns nil if we were lucky enough to
-// reserve right away and errMetaLookupThrottled or context's error otherwise.
-func (c *client) metaLookupLimit(ctx context.Context) error {
-	r := c.metaLookupLimiter.Reserve()
-	if !r.OK() {
-		panic("wtf: cannot reserve a meta lookup")
-	}
-
-	delay := r.Delay()
-	if delay <= 0 {
-		return nil
-	}
-
-	// We've been rate limitted
-	t := time.NewTimer(delay)
-	defer t.Stop()
-	select {
-	case <-t.C:
-		return errMetaLookupThrottled
-	case <-ctx.Done():
-		r.Cancel()
-		return ctx.Err()
-	}
 }
 
 // metaLookup checks meta table for the region in which the given row key for the given table is.
@@ -517,11 +480,6 @@ func (c *client) establishRegion(reg hrpc.RegionInfo, addr string) {
 				}).Info("region became dead while establishing client for it")
 
 				return
-			} else if err == errMetaLookupThrottled {
-				// We've been throttled, backoff and retry the lookup
-				// TODO: backoff might be unnecessary
-				reg = originalReg
-				continue
 			} else if err == ErrClientClosed {
 				// client has been closed
 				return
@@ -556,19 +514,32 @@ func (c *client) establishRegion(reg hrpc.RegionInfo, addr string) {
 			}
 		}
 
-		// connect to the region's regionserver
-		client, err := c.establishRegionClient(reg, addr)
+		var client hrpc.RegionClient
+		if reg == c.adminRegionInfo {
+			// admin region is used for talking to master, so it only has one connection to
+			// master that we don't add to the cache
+			// TODO: consider combining this case with the regular regionserver path
+			client = c.newRegionClientFn(addr, c.clientType, c.rpcQueueSize, c.flushInterval,
+				c.effectiveUser, c.regionReadTimeout)
+		} else {
+			client = c.clients.put(addr, reg, func() hrpc.RegionClient {
+				return c.newRegionClientFn(addr, c.clientType, c.rpcQueueSize, c.flushInterval,
+					c.effectiveUser, c.regionReadTimeout)
+			})
+		}
+
+		// connect to the region's regionserver.
+		// only the first caller to Dial gets to actually connect, other concurrent calls
+		// will block until connected or an error.
+		dialCtx, cancel := context.WithTimeout(reg.Context(), c.regionLookupTimeout)
+		err = client.Dial(dialCtx)
+		cancel()
+
 		if err == nil {
 			if reg == c.adminRegionInfo {
 				reg.SetClient(client)
 				reg.MarkAvailable()
 				return
-			}
-
-			if existing := c.clients.put(client, reg); existing != client {
-				// a client for this regionserver is already in cache, discard this one.
-				client.Close()
-				client = existing
 			}
 
 			if err = isRegionEstablished(client, reg); err == nil {
@@ -585,7 +556,13 @@ func (c *client) establishRegion(reg hrpc.RegionInfo, addr string) {
 			// region is dead
 			reg.MarkAvailable()
 			return
+		} else {
+			// otherwise Dial failed, purge the client and retry.
+			// note that it's safer to reestablish all regions for this client as well
+			// because they could have ended up setteling for the same client.
+			c.clientDown(client)
 		}
+
 		log.WithFields(log.Fields{
 			"region":  reg,
 			"backoff": backoff,
@@ -611,31 +588,6 @@ func sleepAndIncreaseBackoff(ctx context.Context, backoff time.Duration) (time.D
 		return backoff * 2, nil
 	}
 	return backoff + 5000*time.Millisecond, nil
-}
-
-func (c *client) establishRegionClient(reg hrpc.RegionInfo,
-	addr string) (hrpc.RegionClient, error) {
-	if c.clientType != adminClient {
-		// if rpc is not for hbasemaster, check if client for regionserver
-		// already exists
-		if client := c.clients.checkForClient(addr); client != nil {
-			// There's already a client
-			return client, nil
-		}
-	}
-
-	var clientType region.ClientType
-	if c.clientType == standardClient {
-		clientType = region.RegionClient
-	} else {
-		clientType = region.MasterClient
-	}
-	clientCtx, cancel := context.WithTimeout(reg.Context(), c.regionLookupTimeout)
-	defer cancel()
-
-	return region.NewClient(clientCtx, addr, clientType,
-		c.rpcQueueSize, c.flushInterval, c.effectiveUser,
-		c.regionReadTimeout)
 }
 
 // zkResult contains the result of a ZooKeeper lookup (when we're looking for

@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,13 +24,12 @@ import (
 
 	"math"
 
-	atest "github.com/aristanetworks/goarista/test"
-	"github.com/golang/protobuf/proto"
 	log "github.com/sirupsen/logrus"
 	"github.com/tsuna/gohbase"
 	"github.com/tsuna/gohbase/filter"
 	"github.com/tsuna/gohbase/hrpc"
 	"github.com/tsuna/gohbase/pb"
+	"google.golang.org/protobuf/proto"
 )
 
 var host = flag.String("host", "localhost", "The location where HBase is running")
@@ -714,7 +714,7 @@ func TestDelete(t *testing.T) {
 			in: func(key string) (*hrpc.Mutate, error) {
 				return hrpc.NewDelStr(context.Background(), table, key, nil)
 			},
-			out: []*hrpc.Cell{},
+			out: nil,
 		},
 		{
 			// delete the whole row at ts
@@ -803,8 +803,8 @@ func TestDelete(t *testing.T) {
 				c.CellType = pb.CellType_PUT.Enum()
 			}
 
-			if d := atest.Diff(tcase.out, rsp.Cells); d != "" {
-				t.Fatalf("unexpected cells: %s", d)
+			if !reflect.DeepEqual(tcase.out, rsp.Cells) {
+				t.Fatalf("expected %v, got %v", tcase.out, rsp.Cells)
 			}
 		})
 	}
@@ -2064,8 +2064,17 @@ func TestListTableNames(t *testing.T) {
 				t.Error(err)
 			}
 
-			if len(names) != len(tcase.match) {
-				t.Errorf("expected %v, got %v", tcase.match, names)
+			// filter to have only tables that we've created
+			var got []*pb.TableName
+			for _, m := range names {
+				if strings.HasPrefix(string(m.Qualifier), table) ||
+					string(m.Namespace) == "hbase" {
+					got = append(got, m)
+				}
+			}
+
+			if len(got) != len(tcase.match) {
+				t.Errorf("expected %v, got %v", tcase.match, got)
 			}
 
 			for i, m := range tcase.match {

@@ -3,9 +3,7 @@
 // Use of this source code is governed by the Apache License 2.0
 // that can be found in the COPYING file.
 
-// +build testing
-
-package region
+package gohbase
 
 import (
 	"bytes"
@@ -15,9 +13,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/tsuna/gohbase/hrpc"
 	"github.com/tsuna/gohbase/pb"
+	"github.com/tsuna/gohbase/region"
+	"google.golang.org/protobuf/proto"
 )
 
 type testClient struct {
@@ -168,34 +167,6 @@ var test1SplitA = &pb.Result{Cell: []*pb.Cell{
 	},
 }}
 
-var test1SplitB = &pb.Result{Cell: []*pb.Cell{
-	&pb.Cell{
-		Row:       []byte("test1,baz,1480547738107.3f2483f5618e1b791f58f83a8ebba6a9."),
-		Family:    []byte("info"),
-		Qualifier: []byte("regioninfo"),
-		Value: []byte("PBUF\b\xfbÖ\xbc\x8b+\x12\x10\n\adefault\x12\x05" +
-			"test1\x1a\x03baz\"\x00(\x000\x008\x00"),
-	},
-	&pb.Cell{
-		Row:       []byte("test1,baz,1480547738107.3f2483f5618e1b791f58f83a8ebba6a9."),
-		Family:    []byte("info"),
-		Qualifier: []byte("seqnumDuringOpen"),
-		Value:     []byte("\x00\x00\x00\x00\x00\x00\x00\f"),
-	},
-	&pb.Cell{
-		Row:       []byte("test1,baz,1480547738107.3f2483f5618e1b791f58f83a8ebba6a9."),
-		Family:    []byte("info"),
-		Qualifier: []byte("server"),
-		Value:     []byte("regionserver:3"),
-	},
-	&pb.Cell{
-		Row:       []byte("test1,baz,1480547738107.3f2483f5618e1b791f58f83a8ebba6a9."),
-		Family:    []byte("info"),
-		Qualifier: []byte("serverstartcode"),
-		Value:     []byte("\x00\x00\x01X\xb6\x83^3"),
-	},
-}}
-
 var m sync.RWMutex
 var clients map[string]uint32
 
@@ -203,14 +174,17 @@ func init() {
 	clients = make(map[string]uint32)
 }
 
-// NewClient creates a new test region client.
-func NewClient(ctx context.Context, addr string, ctype ClientType,
-	queueSize int, flushInterval time.Duration, effectiveUser string,
-	readTimeout time.Duration) (hrpc.RegionClient, error) {
+func newMockRegionClient(addr string, ctype region.ClientType, queueSize int,
+	flushInterval time.Duration, effectiveUser string,
+	readTimeout time.Duration) hrpc.RegionClient {
 	m.Lock()
 	clients[addr]++
 	m.Unlock()
-	return &testClient{addr: addr}, nil
+	return &testClient{addr: addr}
+}
+
+func (c *testClient) Dial(ctx context.Context) error {
+	return nil
 }
 
 func (c *testClient) Addr() string {
@@ -239,7 +213,7 @@ func (c *testClient) QueueRPC(call hrpc.Call) {
 		if bytes.Equal(call.Table(), []byte("nsre")) {
 			i := atomic.AddInt32(&c.numNSRE, 1)
 			if i <= 3 {
-				call.ResultChan() <- hrpc.RPCResult{Error: NotServingRegionError{}}
+				call.ResultChan() <- hrpc.RPCResult{Error: region.NotServingRegionError{}}
 				return
 			}
 		}
@@ -251,7 +225,7 @@ func (c *testClient) QueueRPC(call hrpc.Call) {
 		// pretend it's down to fail the probe and start a reconnect
 		if bytes.Equal(call.Table(), []byte("down")) {
 			if i <= 1 {
-				call.ResultChan() <- hrpc.RPCResult{Error: ServerError{}}
+				call.ResultChan() <- hrpc.RPCResult{Error: region.ServerError{}}
 			} else {
 				// otherwise, the region is fine
 				call.ResultChan() <- hrpc.RPCResult{}

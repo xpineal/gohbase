@@ -12,8 +12,8 @@ import (
 	"fmt"
 	"unsafe"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/tsuna/gohbase/pb"
+	"google.golang.org/protobuf/proto"
 )
 
 // RegionInfo represents HBase region.
@@ -37,6 +37,9 @@ type RegionInfo interface {
 
 // RegionClient represents HBase region client.
 type RegionClient interface {
+	// Dial connects and bootstraps region client. Only the first caller to Dial gets to
+	// actually connect, other concurrent callers will block until connected or an error.
+	Dial(context.Context) error
 	Close()
 	Addr() string
 	QueueRPC(Call)
@@ -250,6 +253,11 @@ type Result struct {
 	Exists *bool
 }
 
+func (c *Result) String() string {
+	return fmt.Sprintf("cells:%v stale:%v partial:%v exists:%v ",
+		c.Cells, c.Stale, c.Partial, c.Exists)
+}
+
 func extractBool(v *bool) bool {
 	return v != nil && *v
 }
@@ -270,7 +278,7 @@ func ToLocalResult(pbr *pb.Result) *Result {
 }
 
 func toLocalCells(pbr *pb.Result) []*Cell {
-	return *(*[]*Cell)(unsafe.Pointer(pbr))
+	return *(*[]*Cell)(unsafe.Pointer(&pbr.Cell))
 }
 
 // We can now define any helper functions on Result that we want.

@@ -10,9 +10,9 @@ import (
 	"io"
 	"sync"
 
-	"github.com/cznic/b"
 	log "github.com/sirupsen/logrus"
 	"github.com/tsuna/gohbase/hrpc"
+	"modernc.org/b"
 )
 
 // clientRegionCache is client -> region cache. Used to quickly
@@ -23,14 +23,16 @@ type clientRegionCache struct {
 	regions map[hrpc.RegionClient]map[hrpc.RegionInfo]struct{}
 }
 
-// put caches client and associates a region with it. Returns a client that is in cache.
+// put associates a region with client for provided addrss. It returns the client if it's already
+// in cache or otherwise instantiates a new one by calling newClient.
 // TODO: obvious place for optimization (use map with address as key to lookup exisiting clients)
-func (rcc *clientRegionCache) put(c hrpc.RegionClient, r hrpc.RegionInfo) hrpc.RegionClient {
+func (rcc *clientRegionCache) put(addr string, r hrpc.RegionInfo,
+	newClient func() hrpc.RegionClient) hrpc.RegionClient {
 	rcc.m.Lock()
 	for existingClient, regions := range rcc.regions {
 		// check if client already exists, checking by host and port
 		// because concurrent callers might try to put the same client
-		if c.Addr() == existingClient.Addr() {
+		if addr == existingClient.Addr() {
 			// check client already knows about the region, checking
 			// by pointer is enough because we make sure that there are
 			// no regions with the same name around
@@ -40,14 +42,14 @@ func (rcc *clientRegionCache) put(c hrpc.RegionClient, r hrpc.RegionInfo) hrpc.R
 			rcc.m.Unlock()
 
 			log.WithFields(log.Fields{
-				"existingClient": existingClient,
-				"client":         c,
+				"client": existingClient,
 			}).Debug("region client is already in client's cache")
 			return existingClient
 		}
 	}
 
 	// no such client yet
+	c := newClient()
 	rcc.regions[c] = map[hrpc.RegionInfo]struct{}{r: struct{}{}}
 	rcc.m.Unlock()
 
@@ -88,21 +90,6 @@ func (rcc *clientRegionCache) clientDown(c hrpc.RegionClient) map[hrpc.RegionInf
 		log.WithField("client", c).Info("removed region client")
 	}
 	return downregions
-}
-
-// TODO: obvious place for optimization (use map with address as key to lookup exisiting clients)
-func (rcc *clientRegionCache) checkForClient(addr string) hrpc.RegionClient {
-	rcc.m.RLock()
-
-	for client := range rcc.regions {
-		if client.Addr() == addr {
-			rcc.m.RUnlock()
-			return client
-		}
-	}
-
-	rcc.m.RUnlock()
-	return nil
 }
 
 // key -> region cache.
@@ -174,7 +161,7 @@ func (krc *keyRegionCache) getOverlaps(reg hrpc.RegionInfo) []hrpc.RegionInfo {
 	// enum.Prev() returns the region X before it landed, moves pointer to the region X - 1
 	// enum.Next() returns X - 1 and move pointer to X, which has smaller start key
 
-	enum.Prev()
+	_, _, _ = enum.Prev()
 	_, _, err = enum.Next()
 	if err == io.EOF {
 		// we are in the beginning of tree, get new enum starting
@@ -183,11 +170,15 @@ func (krc *keyRegionCache) getOverlaps(reg hrpc.RegionInfo) []hrpc.RegionInfo {
 		enum, err = krc.regions.SeekFirst()
 		if err != nil {
 			log.Fatalf(
-				"error seeking first region when getting  overlaps for region %v: %v", reg, err)
+				"error seeking first region when getting overlaps for region %v: %v", reg, err)
 		}
 	}
 
 	_, v, err = enum.Next()
+	if err != nil {
+		log.Fatalf(
+			"error accessing first region when getting overlaps for region %v: %v", reg, err)
+	}
 	if isRegionOverlap(v.(hrpc.RegionInfo), reg) {
 		overlaps = append(overlaps, v.(hrpc.RegionInfo))
 	}

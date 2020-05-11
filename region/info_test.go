@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/tsuna/gohbase/hrpc"
 	"github.com/tsuna/gohbase/pb"
+	"google.golang.org/protobuf/proto"
 )
 
 // Test parsing the contents of a cell found in meta.
@@ -28,12 +28,12 @@ func TestInfoFromMeta(t *testing.T) {
 		Timestamp: proto.Uint64(1431921690626),
 		CellType:  &put,
 	}
-	info, err := infoFromCell(cell)
+	_, err := infoFromCell(cell)
 	if err == nil || !strings.HasPrefix(err.Error(), "empty value") {
 		t.Errorf("Unexpected error on empty value: %s", err)
 	}
 	cell.Value = buf
-	info, err = infoFromCell(cell)
+	info, err := infoFromCell(cell)
 	if err != nil {
 		t.Fatalf("Failed to parse cell: %s", err)
 	}

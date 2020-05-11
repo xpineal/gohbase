@@ -13,9 +13,9 @@ import (
 	"io"
 	"math"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/tsuna/gohbase/hrpc"
 	"github.com/tsuna/gohbase/pb"
+	"google.golang.org/protobuf/proto"
 )
 
 const noScannerID = math.MaxUint64
@@ -57,7 +57,7 @@ func (s *scanner) Close() error {
 			// If the request fails, the scanner lease will be expired
 			// and it will be closed automatically by hbase.
 			// No need to bother clients about that.
-			s.SendRPC(rpc)
+			_, _ = s.SendRPC(rpc)
 		}()
 	}
 	return nil

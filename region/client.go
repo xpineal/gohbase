@@ -11,15 +11,17 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/tsuna/gohbase/hrpc"
 	"github.com/tsuna/gohbase/pb"
+	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
 )
 
 // ClientType is a type alias to represent the type of this region client
@@ -43,29 +45,33 @@ var (
 	// If a Java exception listed here is returned by HBase, the client should
 	// reestablish region and attempt to resend the RPC message, potentially via
 	// a different region client.
-	javaRegionExceptions = map[string]struct{}{
-		"org.apache.hadoop.hbase.NotServingRegionException":       struct{}{},
-		"org.apache.hadoop.hbase.exceptions.RegionMovedException": struct{}{},
+	// The value of exception should be contained in the stack trace.
+	javaRegionExceptions = map[string]string{
+		"org.apache.hadoop.hbase.NotServingRegionException":       "",
+		"org.apache.hadoop.hbase.exceptions.RegionMovedException": "",
+		"java.io.IOException": "Cannot append; log is closed",
 	}
 
 	// If a Java exception listed here is returned by HBase, the client should
 	// backoff and resend the RPC message to the same region and region server
-	javaRetryableExceptions = map[string]struct{}{
-		"org.apache.hadoop.hbase.CallQueueTooBigException":          struct{}{},
-		"org.apache.hadoop.hbase.exceptions.RegionOpeningException": struct{}{},
-		"org.apache.hadoop.hbase.ipc.ServerNotRunningYetException":  struct{}{},
-		"org.apache.hadoop.hbase.quotas.RpcThrottlingException":     struct{}{},
-		"org.apache.hadoop.hbase.RetryImmediatelyException":         struct{}{},
-		"org.apache.hadoop.hbase.RegionTooBusyException":            struct{}{},
+	// The value of exception should be contained in the stack trace.
+	javaRetryableExceptions = map[string]string{
+		"org.apache.hadoop.hbase.CallQueueTooBigException":          "",
+		"org.apache.hadoop.hbase.exceptions.RegionOpeningException": "",
+		"org.apache.hadoop.hbase.ipc.ServerNotRunningYetException":  "",
+		"org.apache.hadoop.hbase.quotas.RpcThrottlingException":     "",
+		"org.apache.hadoop.hbase.RetryImmediatelyException":         "",
+		"org.apache.hadoop.hbase.RegionTooBusyException":            "",
 	}
 
 	// javaServerExceptions is a map where all Java exceptions that signify
 	// the RPC should be sent again are listed (as keys). If a Java exception
 	// listed here is returned by HBase, the RegionClient will be closed and a new
 	// one should be established.
-	javaServerExceptions = map[string]struct{}{
-		"org.apache.hadoop.hbase.regionserver.RegionServerAbortedException": struct{}{},
-		"org.apache.hadoop.hbase.regionserver.RegionServerStoppedException": struct{}{},
+	// The value of exception should be contained in the stack trace.
+	javaServerExceptions = map[string]string{
+		"org.apache.hadoop.hbase.regionserver.RegionServerAbortedException": "",
+		"org.apache.hadoop.hbase.regionserver.RegionServerStoppedException": "",
 	}
 )
 
@@ -102,7 +108,7 @@ func newBuffer(size int) []byte {
 }
 
 func freeBuffer(b []byte) {
-	bufferPool.Put(b[:0])
+	bufferPool.Put(b[:0]) // nolint:staticcheck
 }
 
 // ServerError is an error that this region.Client can't recover from.
@@ -148,10 +154,13 @@ type client struct {
 	conn net.Conn
 
 	// Address of the RegionServer.
-	addr string
+	addr  string
+	ctype ClientType
 
-	// once used for concurrent calls to fail
-	once sync.Once
+	// dialOnce used for concurrent calls to Dial
+	dialOnce sync.Once
+	// failOnce used for concurrent calls to fail
+	failOnce sync.Once
 
 	rpcs chan hrpc.Call
 	done chan struct{}
@@ -169,7 +178,6 @@ type client struct {
 
 	rpcQueueSize  int
 	flushInterval time.Duration
-
 	effectiveUser string
 
 	// readTimeout is the maximum amount of time to wait for regionserver reply
@@ -211,27 +219,35 @@ func (c *client) String() string {
 	return fmt.Sprintf("RegionClient{Addr: %s}", c.addr)
 }
 
-func (c *client) inFlightUp() {
+func (c *client) inFlightUp() error {
 	c.inFlightM.Lock()
 	c.inFlight++
 	// we expect that at least the last request can be completed within readTimeout
-	c.conn.SetReadDeadline(time.Now().Add(c.readTimeout))
+	if err := c.conn.SetReadDeadline(time.Now().Add(c.readTimeout)); err != nil {
+		c.inFlightM.Unlock()
+		return err
+	}
 	c.inFlightM.Unlock()
+	return nil
 }
 
-func (c *client) inFlightDown() {
+func (c *client) inFlightDown() error {
 	c.inFlightM.Lock()
 	c.inFlight--
 	// reset read timeout if we are not waiting for any responses
 	// in order to prevent from closing this client if there are no request
 	if c.inFlight == 0 {
-		c.conn.SetReadDeadline(time.Time{})
+		if err := c.conn.SetReadDeadline(time.Time{}); err != nil {
+			c.inFlightM.Unlock()
+			return err
+		}
 	}
 	c.inFlightM.Unlock()
+	return nil
 }
 
 func (c *client) fail(err error) {
-	c.once.Do(func() {
+	c.failOnce.Do(func() {
 		if err != ErrClientClosed {
 			log.WithFields(log.Fields{
 				"client": c,
@@ -249,7 +265,9 @@ func (c *client) fail(err error) {
 		// close connection to the regionserver
 		// to let it know that we can't receive anymore
 		// and fail all the rpcs being sent
-		c.conn.Close()
+		if c.conn != nil {
+			c.conn.Close()
+		}
 
 		c.failSentRPCs()
 	})
@@ -445,11 +463,16 @@ func (c *client) receive() (err error) {
 		return ServerError{err}
 	}
 
-	buf := proto.NewBuffer(b)
-
-	if err = buf.DecodeMessage(&header); err != nil {
-		return ServerError{fmt.Errorf("failed to decode the response header: %s", err)}
+	// unmarshal header
+	headerBytes, headerLen := protowire.ConsumeBytes(b)
+	if headerLen < 0 {
+		return ServerError{fmt.Errorf("failed to decode the response header: %v",
+			protowire.ParseError(headerLen))}
 	}
+	if err = proto.Unmarshal(headerBytes, &header); err != nil {
+		return ServerError{fmt.Errorf("failed to decode the response header: %v", err)}
+	}
+
 	if header.CallId == nil {
 		return ErrMissingCallID
 	}
@@ -459,7 +482,9 @@ func (c *client) receive() (err error) {
 	if rpc == nil {
 		return ServerError{fmt.Errorf("got a response with an unexpected call ID: %d", callID)}
 	}
-	c.inFlightDown()
+	if err := c.inFlightDown(); err != nil {
+		return ServerError{err}
+	}
 
 	select {
 	case <-rpc.Context().Done():
@@ -479,16 +504,25 @@ func (c *client) receive() (err error) {
 	}
 
 	response = rpc.NewResponse()
-	if err = buf.DecodeMessage(response); err != nil {
+
+	responseBytes, responseLen := protowire.ConsumeBytes(b[headerLen:])
+	if responseLen < 0 {
+		err = RetryableError{fmt.Errorf("failed to decode the response: %s",
+			protowire.ParseError(responseLen))}
+		return
+	}
+
+	if err = proto.Unmarshal(responseBytes, response); err != nil {
 		err = RetryableError{fmt.Errorf("failed to decode the response: %s", err)}
 		return
 	}
+
 	var cellsLen uint32
 	if header.CellBlockMeta != nil {
 		cellsLen = header.CellBlockMeta.GetLength()
 	}
 	if d, ok := rpc.(canDeserializeCellBlocks); cellsLen > 0 && ok {
-		b := buf.Bytes()[size-cellsLen:]
+		b := b[size-cellsLen:]
 		var nread uint32
 		nread, err = d.DeserializeCellBlocks(response, b)
 		if err != nil {
@@ -505,11 +539,11 @@ func (c *client) receive() (err error) {
 
 func exceptionToError(class, stack string) error {
 	err := fmt.Errorf("HBase Java exception %s:\n%s", class, stack)
-	if _, ok := javaRetryableExceptions[class]; ok {
+	if s, ok := javaRetryableExceptions[class]; ok && strings.Contains(stack, s) {
 		return RetryableError{err}
-	} else if _, ok := javaRegionExceptions[class]; ok {
+	} else if s, ok := javaRegionExceptions[class]; ok && strings.Contains(stack, s) {
 		return NotServingRegionError{err}
-	} else if _, ok := javaServerExceptions[class]; ok {
+	} else if s, ok := javaServerExceptions[class]; ok && strings.Contains(stack, s) {
 		return ServerError{err}
 	}
 	return err
@@ -528,12 +562,12 @@ func (c *client) readFully(buf []byte) error {
 }
 
 // sendHello sends the "hello" message needed when opening a new connection.
-func (c *client) sendHello(ctype ClientType) error {
+func (c *client) sendHello() error {
 	connHeader := &pb.ConnectionHeader{
 		UserInfo: &pb.UserInformation{
 			EffectiveUser: proto.String(c.effectiveUser),
 		},
-		ServiceName:         proto.String(string(ctype)),
+		ServiceName:         proto.String(string(c.ctype)),
 		CellBlockCodecClass: proto.String("org.apache.hadoop.hbase.codec.KeyValueCodec"),
 	}
 	data, err := proto.Marshal(connHeader)
@@ -553,15 +587,13 @@ func (c *client) sendHello(ctype ClientType) error {
 // send sends an RPC out to the wire.
 // Returns the response (for now, as the call is synchronous).
 func (c *client) send(rpc hrpc.Call) (uint32, error) {
+	var err error
 	b := newBuffer(4)
 	defer func() { freeBuffer(b) }()
 
-	buf := proto.NewBuffer(b[4:])
-	buf.Reset()
-
 	request := rpc.ToProto()
 
-	// we have to register rpc after we marhsal because
+	// we have to register rpc after we marshal because
 	// registered rpc can fail before it was even sent
 	// in all the cases where c.fail() is called.
 	// If that happens, client can retry sending the rpc
@@ -573,21 +605,29 @@ func (c *client) send(rpc hrpc.Call) (uint32, error) {
 		MethodName:   proto.String(rpc.Name()),
 		RequestParam: proto.Bool(true),
 	}
-	if err := buf.EncodeMessage(header); err != nil {
+
+	b = protowire.AppendVarint(b, uint64(proto.Size(header)))
+	b, err = proto.MarshalOptions{}.MarshalAppend(b, header)
+	if err != nil {
 		return id, fmt.Errorf("failed to marshal request header: %s", err)
 	}
 
-	if err := buf.EncodeMessage(request); err != nil {
+	if request == nil {
+		return id, errors.New("failed to marshal request: proto: Marshal called with nil")
+	}
+	b = protowire.AppendVarint(b, uint64(proto.Size(request)))
+	b, err = proto.MarshalOptions{}.MarshalAppend(b, request)
+	if err != nil {
 		return id, fmt.Errorf("failed to marshal request: %s", err)
 	}
 
-	payload := buf.Bytes()
-	binary.BigEndian.PutUint32(b, uint32(len(payload)))
-	b = append(b[:4], payload...)
+	binary.BigEndian.PutUint32(b, uint32(len(b)-4))
 
 	if err := c.write(b); err != nil {
 		return id, ServerError{err}
 	}
-	c.inFlightUp()
+	if err := c.inFlightUp(); err != nil {
+		return id, ServerError{err}
+	}
 	return id, nil
 }
